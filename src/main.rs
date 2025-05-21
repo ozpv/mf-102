@@ -1,7 +1,14 @@
 use hound::{WavReader, WavWriter};
 use std::f32::consts::PI;
 
-#[allow(unused)]
+const RING_MOD_PARAMS: RingModParams = RingModParams {
+    mix: 71,
+    frequency: 156.0,
+    amount: 6.7,
+    lfo_waveform: Waveform::Square,
+    rate: 0.18,
+};
+
 enum Waveform {
     /// Sinusoidal LFO wave form will smoothly oscillate between 0-3 octaves above PARAMS.frequency
     Sinusoidal,
@@ -9,7 +16,7 @@ enum Waveform {
     Square,
 }
 
-struct Params {
+struct RingModParams {
     /// LFO section
     /// 0 to 10, this is normalized and controls a percentage of a 3 octave jump
     amount: f32,
@@ -25,36 +32,33 @@ struct Params {
     frequency: f32,
 }
 
-const PARAMS: Params = Params {
-    mix: 71,
-    frequency: 156.0,
-    amount: 6.7,
-    lfo_waveform: Waveform::Square,
-    rate: 0.18,
-};
+fn ring_mod(
+    sample_rate: u32,
+    sample_length: usize,
+    signal: impl IntoIterator<Item = i32>,
+    params: &RingModParams,
+) -> Vec<i32> {
+    let mut res = vec![];
 
-fn main() {
-    let r = WavReader::open("guitar.wav").unwrap();
-    let mut w = WavWriter::create("output.wav", r.spec()).unwrap();
+    // normalized mix and amount parameter
+    let mix = f32::from(params.mix) / 100.0;
+    let amount = params.amount / 10.0;
 
-    // total number of samples in the input file "guitar.wav"
-    let len = r.len();
-    let sample_rate = r.spec().sample_rate;
-    let mut samples_iter = r.into_samples::<i32>();
+    // the signal
+    let mut signal_iter = signal.into_iter();
 
-    // counts the current time into reader in seconds
-    let mut time = 0.0;
+    let mut lfo_phase = 0.0;
+    let mut carrier_phase = 0.0;
 
-    // normalized mix parameter
-    let mix = PARAMS.mix as f32 / 100.0;
+    let lfo_increment = 2.0 * PI * params.rate / sample_rate as f32;
 
-    for _ in 0..len {
-        time += 1.0 / sample_rate as f32;
+    for _ in 0..sample_length {
+        lfo_phase = (lfo_phase + lfo_increment).rem_euclid(2.0 * PI);
 
-        let lfo = match PARAMS.lfo_waveform {
-            Waveform::Sinusoidal => (2.0 * PI * PARAMS.rate * time).sin(),
+        let lfo = match params.lfo_waveform {
+            Waveform::Sinusoidal => lfo_phase.sin(),
             Waveform::Square => {
-                if (2.0 * PI * PARAMS.rate * time).sin() >= 0.0 {
+                if lfo_phase.sin() >= 0.0 {
                     1.0
                 } else {
                     0.0
@@ -63,28 +67,48 @@ fn main() {
         };
 
         // the carrier signal that's applied to the sampled one
-        let carrier = (2.0
-            * PI
-            * (PARAMS.frequency + lfo * (PARAMS.frequency * 3.0 * (PARAMS.amount / 10.0)))
-            * time)
-            .sin();
+        let carrier_increment =
+            2.0 * PI * (params.frequency + lfo * (params.frequency * 3.0 * amount))
+                / sample_rate as f32;
 
-        if let Some(sample) = samples_iter.next().and_then(Result::ok) {
+        carrier_phase = (carrier_phase + carrier_increment).rem_euclid(2.0 * PI);
+
+        let carrier = carrier_phase.sin();
+
+        if let Some(sample) = signal_iter.next() {
             let sample = sample as f32;
 
             // accounted for the mix parameter
             // see https://en.wikipedia.org/wiki/Ring_modulation#Simplified_operation
             let out_sample = (sample * (1.0 - mix)) + (sample * carrier * mix);
 
-            w.write_sample(out_sample as i32).unwrap();
+            res.push(out_sample as i32);
         } else {
-            println!("Failed to write all samples");
+            println!("Signal processing may be incomplete");
             break;
         }
     }
 
-    // dropping the writer writes to output.wav
-    drop(w);
+    res
+}
 
-    println!("Wrote {len} samples to output.wav");
+fn main() {
+    let r = WavReader::open("guitar.wav").unwrap();
+    let mut w = WavWriter::create("output.wav", r.spec()).unwrap();
+
+    // total number of samples in the input file "guitar.wav"
+    let len = r.len();
+    let sample_rate = r.spec().sample_rate;
+
+    // the actual signal
+    let signal = r
+        .into_samples()
+        .map(|sample| sample.expect("Failed to open signal as an array"))
+        .collect::<Vec<i32>>();
+
+    let ring_mod_result = ring_mod(sample_rate, len as usize, signal, &RING_MOD_PARAMS);
+
+    for sample in ring_mod_result {
+        w.write_sample(sample).unwrap();
+    }
 }
